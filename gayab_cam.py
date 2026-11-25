@@ -44,6 +44,9 @@ class GayabCamApp:
         self.charging_time = 0.0
         self.required_charge_time = 0.75 # seconds to hold goku pose
         self.cooldown = 0.0 # prevent instant toggling
+        self.gesture_streak = 0
+        self.last_gesture_name = "NONE"
+        self.gesture_debounce_frames = 4
 
         # Background calibration
         self.background_frame: Optional[np.ndarray] = None
@@ -226,19 +229,29 @@ class GayabCamApp:
                 rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
 
-                # 1. Segmentation
-                seg_result = self.segmenter.segment(mp_image)
-                confidence_mask = seg_result.confidence_masks[0].numpy_view()
-                person_mask = (confidence_mask > 0.45).astype(np.float32)
-                # Smooth mask edges
-                person_mask = cv2.GaussianBlur(person_mask, (15, 15), 0)
-
-                # 2. Hand Gesture Evaluation
+                # 1. Hand Gesture Evaluation with multi-frame debounce
                 hand_result = self.hand_landmarker.detect(mp_image)
                 detected_gesture = evaluate_gestures(hand_result.hand_landmarks)
 
-                # Process gestures
-                if detected_gesture.name == "NINJA_SEAL":
+                if detected_gesture.name == self.last_gesture_name and detected_gesture.name != "NONE":
+                    self.gesture_streak += 1
+                else:
+                    self.last_gesture_name = detected_gesture.name
+                    self.gesture_streak = 1 if detected_gesture.name != "NONE" else 0
+
+                # 2. Segmentation (only run when vanished or triggering V-sign dissolve)
+                person_mask = None
+                needs_segmentation = self.is_vanished or (
+                    detected_gesture.name == "V_SIGN" and self.gesture_streak >= self.gesture_debounce_frames
+                )
+                if needs_segmentation:
+                    seg_result = self.segmenter.segment(mp_image)
+                    confidence_mask = seg_result.confidence_masks[0].numpy_view()
+                    person_mask = (confidence_mask > 0.45).astype(np.float32)
+                    person_mask = cv2.GaussianBlur(person_mask, (15, 15), 0)
+
+                # Process debounced gestures
+                if detected_gesture.name == "NINJA_SEAL" and self.gesture_streak >= self.gesture_debounce_frames:
                     self.trigger_ninja_jutsu(w, h)
                 elif detected_gesture.name == "GOKU_TELEPORT":
                     if not self.is_vanished:
@@ -251,7 +264,7 @@ class GayabCamApp:
                             self.charging_time = 0.0
                     else:
                         self.trigger_goku_teleport(w, h)
-                elif detected_gesture.name == "V_SIGN":
+                elif detected_gesture.name == "V_SIGN" and self.gesture_streak >= self.gesture_debounce_frames:
                     self.trigger_dissolve(person_mask, frame)
                 else:
                     self.charging_time = max(0.0, self.charging_time - dt * 2.0)
@@ -259,7 +272,7 @@ class GayabCamApp:
                 # Render output composite
                 output_frame = frame.copy()
 
-                if self.is_vanished and self.background_frame is not None:
+                if self.is_vanished and self.background_frame is not None and person_mask is not None:
                     # Blend user out with background
                     bg = cv2.resize(self.background_frame, (w, h))
                     mask_3ch = np.repeat(person_mask[:, :, np.newaxis], 3, axis=2)
